@@ -128,10 +128,14 @@ class OpenSubtitlesComSubtitle(Subtitle):
             # series
             self.matches.add('series')
             # season
-            if video.season == self.season:
+            absolute_episode_match = (
+                getattr(video, 'absolute_episode', None) == self.episode
+                and self.season == 1
+            )
+            if video.season == self.season or absolute_episode_match:
                 self.matches.add('season')
             # episode
-            if video.episode == self.episode:
+            if video.episode == self.episode or absolute_episode_match:
                 self.matches.add('episode')
             # imdb
             if self.imdb_match:
@@ -146,7 +150,7 @@ class OpenSubtitlesComSubtitle(Subtitle):
         # rest is same for both groups
 
         # year
-        if video.year == self.year:
+        if self.imdb_match or video.year == self.year:
             self.matches.add('year')
 
         # release_group
@@ -403,12 +407,35 @@ class OpenSubtitlesComProvider(ProviderRetryMixin, Provider):
 
         result = res.json()
 
-        if not result['data'] and file_hash:
-            logger.debug("Hash query returned 0 results, retrying without moviehash")
-            params_no_hash = [(k, v) for k, v in params if k != 'moviehash']
+        # Long-running anime are often indexed as S01E<absolute>, while
+        # Sonarr exposes TVDB seasonal numbering. Retry with the absolute
+        # episode number when the seasonal query has no results.
+        absolute_episode = getattr(self.video, 'absolute_episode', None)
+        if (
+            isinstance(self.video, Episode)
+            and absolute_episode
+            and absolute_episode != self.video.episode
+            and not result['data']
+        ):
+            absolute_params = [
+                (key, value)
+                for key, value in params
+                if key not in {'episode_number', 'season_number', 'moviehash'}
+            ]
+            absolute_params.extend([
+                ('episode_number', absolute_episode),
+                ('season_number', 1),
+            ])
+            absolute_params = sorted(absolute_params, key=lambda param: param[0])
+            logger.info(
+                'No OpenSubtitles results using seasonal numbering; retrying '
+                f'with absolute episode number: {absolute_params}'
+            )
             res = self.retry(
                 lambda: self.checked(
-                    lambda: self.session.get(self.server_url() + 'subtitles', params=params_no_hash, timeout=30),
+                    lambda: self.session.get(
+                        self.server_url() + 'subtitles', params=absolute_params, timeout=30
+                    ),
                     validate_json=True,
                     json_key_name='data'
                 ),
@@ -460,6 +487,16 @@ class OpenSubtitlesComProvider(ProviderRetryMixin, Provider):
                 except TypeError:
                     year = item['attributes']['feature_details']['year']
 
+                try:
+                    feature_details = item['attributes']['feature_details']
+                    imdb_match = (
+                        feature_details.get('parent_imdb_id') == self.sanitize_external_ids(self.video.series_imdb_id)
+                        or feature_details.get('imdb_id') == self.sanitize_external_ids(self.video.imdb_id)
+                    )
+                except Exception as error:
+                    logger.debug(f"Error while comparing IMDb ids: {error}")
+                    imdb_match = False
+
                 if len(item['attributes']['files']):
                     subtitle = OpenSubtitlesComSubtitle(
                         language=Language.fromietf(from_opensubtitlescom(item['attributes']['language'])),
@@ -474,7 +511,7 @@ class OpenSubtitlesComProvider(ProviderRetryMixin, Provider):
                         season=season_number,
                         episode=episode_number,
                         hash_matched=moviehash_match,
-                        imdb_match=True if imdb_id else False
+                        imdb_match=imdb_match
                     )
                     # Compat layer exposes these on attributes.download_count /
                     # attributes.ratings / attributes.ai_translated so the
